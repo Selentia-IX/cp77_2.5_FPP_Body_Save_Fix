@@ -13,7 +13,15 @@ Needs Python 3.8 or newer, nothing else.
 import shutil
 import struct
 import sys
+import tempfile
 from pathlib import Path
+
+
+def need(ok, why):
+    """A real check, unlike assert, which python -O / PYTHONOPTIMIZE would skip."""
+    if not ok:
+        raise ValueError(why)
+
 
 def lz4_block_decompress(src, size):
     """Plain LZ4 block format (no frame header)."""
@@ -47,7 +55,7 @@ def lz4_block_decompress(src, size):
         start = len(out) - off
         for k in range(mlen):  # byte by byte: matches may overlap themselves
             out.append(out[start + k])
-    assert len(out) == size, f"LZ4 gave {len(out)} bytes, expected {size}"
+    need(len(out) == size, f"LZ4 gave {len(out)} bytes, expected {size}")
     return bytes(out)
 
 
@@ -93,7 +101,8 @@ def lz4_block_compress(src):
     return bytes(out)
 
 
-assert lz4_block_decompress(lz4_block_compress(b"abcabcabcabcabcabc-xyz" * 50), 1100) == b"abcabcabcabcabcabc-xyz" * 50
+need(lz4_block_decompress(lz4_block_compress(b"abcabcabcabcabcabc-xyz" * 50), 1100) == b"abcabcabcabcabcabc-xyz" * 50,
+     "LZ4 self-test failed")
 
 
 class Save:
@@ -122,7 +131,7 @@ class Save:
         d = self.raw
         pos = struct.unpack_from("<I", d, len(d) - 8)[0]
         self.table_pos = pos
-        assert d[pos:pos + 4] == b"EDON", "node table not found"
+        need(d[pos:pos + 4] == b"EDON", "node table not found")
         pos += 4
         count, pos = read_vlq(d, pos)
         nodes, self.record_pos = [], []
@@ -134,7 +143,7 @@ class Save:
             self.record_pos.append(pos)  # where this node's 16-byte record starts in the file
             pos += 16
             nodes.append((name, nxt, child, off, size))
-        assert pos == len(d) - 8, "node table doesn't end at the footer"
+        need(pos == len(d) - 8, "node table doesn't end at the footer")
         return nodes
 
     def node(self, name):
@@ -190,7 +199,7 @@ def fixed_node(node):
     t0, t1, tpp = group(node, "TPP_Body")
     if any(o == "body_color" for o, _ in fpp):
         return None  # already a 2.5-style preset
-    assert any(o == "body_color" for o, _ in tpp), "TPP_Body has no body_color to copy"
+    need(any(o == "body_color" for o, _ in tpp), "TPP_Body has no body_color to copy")
     return node[:f0] + packed("FPP_Body") + node[t0 + len(packed("TPP_Body")):t1] + node[f1:]
 
 
@@ -202,7 +211,7 @@ def rebuild(src, new_node):
     a = off - s.data_start
     data = s.data[:a] + new_node + s.data[a + size:]
 
-    assert all(c[2] == CHUNK for c in s.chunks[:-1]), "unexpected chunk layout"
+    need(all(c[2] == CHUNK for c in s.chunks[:-1]), "unexpected chunk layout")
     first = a // CHUNK  # chunks before the edit are copied as they are
     blobs = [src[c[0]:c[0] + c[1]] for c in s.chunks[:first]]
     for k in range(first * CHUNK, len(data), CHUNK):
@@ -212,7 +221,7 @@ def rebuild(src, new_node):
 
     fz = src.index(b"FZLC")
     capacity = (s.data_start - fz - 8) // 12
-    assert len(blobs) <= capacity, "chunk table full"
+    need(len(blobs) <= capacity, "chunk table full")
     table, pos = bytearray(), s.data_start
     for blob, sz in zip(blobs, sizes):
         table += struct.pack("<III", pos, len(blob), sz)
@@ -234,17 +243,18 @@ def rebuild(src, new_node):
 
 def check(src_save, out, new_node, delta):
     t = Save(out)
-    assert len(t.data) == len(src_save.data) + delta
-    assert t.node(NODE) == new_node
+    need(len(t.data) == len(src_save.data) + delta, "fixed save has the wrong size")
+    need(t.node(NODE) == new_node, "fixed save doesn't read back the new body entries")
     _, _, fpp = group(new_node, "FPP_Body")
     _, _, tpp = group(new_node, "TPP_Body")
     # TPP_Body's entry count varies by save (underwear, options); 2.5 keeps FPP_Body equal to it, whatever it holds
-    assert fpp == tpp and any(o == "body_color" for o, _ in fpp), \
-        f"FPP_Body didn't come out like TPP_Body (FPP {[o for o, _ in fpp]}, TPP {[o for o, _ in tpp]})"
+    need(fpp == tpp and any(o == "body_color" for o, _ in fpp),
+         f"FPP_Body didn't come out like TPP_Body (FPP {[o for o, _ in fpp]}, TPP {[o for o, _ in tpp]})")
+    need(len(src_save.nodes) == len(t.nodes), "fixed save has a different number of nodes")
     for (name, *_), (name2, *_) in zip(src_save.nodes, t.nodes):
-        assert name == name2
+        need(name == name2, f"node {name} moved")
         if name != NODE:
-            assert src_save.node(name) == t.node(name), f"node {name} changed"
+            need(src_save.node(name) == t.node(name), f"node {name} changed")
 
 
 def fix_folder(src_dir):
@@ -261,11 +271,17 @@ def fix_folder(src_dir):
     while (src_dir.parent / f"ManualSave-{n}").exists():  # never overwrite an existing save
         n += 1
     out_dir = src_dir.parent / f"ManualSave-{n}"
-    out_dir.mkdir()
-    (out_dir / "sav.dat").write_bytes(out)
-    for f in src_dir.iterdir():
-        if f.is_file() and f.name != "sav.dat":
-            shutil.copy2(f, out_dir / f.name)
+    # build the save in a hidden temp folder and rename it at the end, so a failed write never leaves a broken save
+    tmp = Path(tempfile.mkdtemp(prefix=".fpp_fix_", dir=src_dir.parent))
+    try:
+        (tmp / "sav.dat").write_bytes(out)
+        for f in src_dir.iterdir():
+            if f.is_file() and f.name != "sav.dat":
+                shutil.copy2(f, tmp / f.name)
+        tmp.rename(out_dir)
+    except BaseException:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
     print(f"{src_dir.name}: fixed. The fixed copy is the new save {out_dir.name} (your original is unchanged).")
     return out_dir
 
