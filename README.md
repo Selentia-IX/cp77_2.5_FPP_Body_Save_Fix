@@ -35,7 +35,7 @@ You need **Python 3.8 or newer** ([python.org](https://www.python.org/downloads/
    (paste that into the File Explorer address bar)
 2. Find the save you want to fix, for example `ManualSave-3`. The newest one is usually best.
 3. Drag that save **folder** onto `Fix first-person body.bat`.
-4. Load the new save it makes (`ManualSave-4`, or the next free number) and look down in first person.
+4. Load the new save it makes (`ManualSave-50`, or the next free number) and look down in first person.
 5. Keep playing from the fixed save. Saves you make from it stay fixed.
 
 Or from a terminal:
