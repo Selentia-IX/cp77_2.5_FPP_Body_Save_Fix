@@ -1,9 +1,13 @@
 """Cyberpunk 2077 2.5: fix the missing first-person body on characters made before 2.5.
 
-Characters created before patch 2.5 keep an old FPP_Body entry in the save that has no skin entry, so on 2.5 you
-can't see your torso when you look down in first person (inventory and photo mode are fine). 2.5 saves store the
-first-person body exactly like the third-person one. This tool copies the save's own third-person body entries
-(TPP_Body: body_color, body_color_censored, underpants) into FPP_Body, the way a 2.5 save has them.
+Characters created before patch 2.5 keep an old FPP_Body group in the save that has no first-person skin entry, so
+on 2.5 you can't see your torso when you look down in first person (inventory and photo mode are fine).
+This tool writes the first-person skin entries the game itself uses for that group (female_cco's FPP_Body options):
+fpp_body_color and fpp_body_color_censored, with the first-person look of the character's own skin tone
+(TPP_Body's body_color look, "_base__" -> "_fpp__"), and keeps the group's other first-person entries.
+1.0/1.1 copied the third-person entries (body_color, ...) instead: the torso showed until the next visit to a mirror
+or ripperdoc, which rebuilds FPP_Body from the fpp_ options and dropped it again. Saves fixed with 1.0/1.1 are
+repaired by running this version on them.
 
 Usage: drag a save folder onto "Fix first-person body.bat", or: python fpp_body_fix.py <save folder> [...]
 The fixed copy is written as a new save (ManualSave-50 and up) next to the original. Nothing is overwritten.
@@ -168,14 +172,30 @@ def read_vlq(d, pos):
 
 NODE = "CharacetrCustomization_Appearances"  # CDPR's spelling
 CHUNK = 0x40000
+APPS = "base\\characters\\common\\player_base_bodies\\appearances\\"
+
+
+def fnv1a64(path):
+    """The game's resource path hash (paths are stored this way in the save)."""
+    h = 0xCBF29CE484222325
+    for b in path.lower().replace("/", "\\").encode():
+        h = ((h ^ b) * 0x100000001B3) & 0xFFFFFFFFFFFFFFFF
+    return h
+
+
+need(fnv1a64("") == 0xCBF29CE484222325 and fnv1a64("a") == 0xAF63DC4C8601EC8C, "FNV-1a self-test failed")
+FPP_APP = fnv1a64(APPS + "t0_000_fpp__full.app")
+FPP_APP_CENSORED = fnv1a64(APPS + "t0_000_fpp__full_censored.app")
 
 
 def packed(name):
+    need(len(name) < 64, f"name too long for a one-byte length: {name}")
     return bytes([0x80 | len(name)]) + name.encode()
 
 
 def group(d, name):
-    """(start, end, entries) of a body group: name, u32 count, then per entry hash, look, option, two u32."""
+    """(start, end, entries) of a body group: name, u32 count, then per entry hash, look, option, two u32.
+    Entries are (option, look, hash, a, b)."""
     start = d.index(packed(name))
     n, p = read_vlq(d, start)
     p += n
@@ -183,24 +203,47 @@ def group(d, name):
     p += 4
     entries = []
     for _ in range(count):
+        h = struct.unpack_from("<Q", d, p)[0]
         p += 8
         n, p = read_vlq(d, p)
         look = d[p:p + n].decode()
         p += n
         n, p = read_vlq(d, p)
         option = d[p:p + n].decode()
-        p += n + 8
-        entries.append((option, look))
+        p += n
+        a, b = struct.unpack_from("<II", d, p)
+        p += 8
+        entries.append((option, look, h, a, b))
     return start, p, entries
+
+
+def encode_group(name, entries):
+    out = packed(name) + struct.pack("<I", len(entries))
+    for option, look, h, a, b in entries:
+        out += struct.pack("<Q", h) + packed(look) + packed(option) + struct.pack("<II", a, b)
+    return out
+
+
+def first_person_entries(node):
+    """The FPP_Body entries this save should have: the first-person skin pair, then the group's own first-person
+    entries (fpp_nipples_*, underpants, ...); third-person copies made by 1.0/1.1 are dropped."""
+    _, _, fpp = group(node, "FPP_Body")
+    _, _, tpp = group(node, "TPP_Body")
+    skin = [look for option, look, *_ in tpp if option == "body_color"]
+    need(len(skin) == 1 and "_base__" in skin[0], f"TPP_Body has no usable body_color ({skin})")
+    look = skin[0].replace("_base__", "_fpp__")  # t0_000_pwa_base__01_ca_pale -> t0_000_pwa_fpp__01_ca_pale
+    keep = [e for e in fpp if e[0] not in ("fpp_body_color", "fpp_body_color_censored")
+            and (e[0].startswith("fpp_") or e[0] == "underpants" or e[0].startswith("body_scars"))]
+    # tails as the game writes them: (1,1) for the main look, (1,0) for the censored one
+    return [("fpp_body_color", look, FPP_APP, 1, 1), ("fpp_body_color_censored", look, FPP_APP_CENSORED, 1, 0)] + keep
 
 
 def fixed_node(node):
     f0, f1, fpp = group(node, "FPP_Body")
-    t0, t1, tpp = group(node, "TPP_Body")
-    if any(o == "body_color" for o, _ in fpp):
-        return None  # already a 2.5-style preset
-    need(any(o == "body_color" for o, _ in tpp), "TPP_Body has no body_color to copy")
-    return node[:f0] + packed("FPP_Body") + node[t0 + len(packed("TPP_Body")):t1] + node[f1:]
+    want = first_person_entries(node)
+    if fpp == want:
+        return None  # already has the 2.5 first-person entries
+    return node[:f0] + encode_group("FPP_Body", want) + node[f1:]
 
 
 def rebuild(src, new_node):
@@ -246,10 +289,9 @@ def check(src_save, out, new_node, delta):
     need(len(t.data) == len(src_save.data) + delta, "fixed save has the wrong size")
     need(t.node(NODE) == new_node, "fixed save doesn't read back the new body entries")
     _, _, fpp = group(new_node, "FPP_Body")
-    _, _, tpp = group(new_node, "TPP_Body")
-    # TPP_Body's entry count varies by save (underwear, options); 2.5 keeps FPP_Body equal to it, whatever it holds
-    need(fpp == tpp and any(o == "body_color" for o, _ in fpp),
-         f"FPP_Body didn't come out like TPP_Body (FPP {[o for o, _ in fpp]}, TPP {[o for o, _ in tpp]})")
+    need(fpp == first_person_entries(new_node) and fpp[0][0] == "fpp_body_color",
+         f"FPP_Body didn't come out as intended ({[o for o, *_ in fpp]})")
+    need(group(new_node, "TPP_Body")[2] == group(src_save.node(NODE), "TPP_Body")[2], "TPP_Body changed")
     need(len(src_save.nodes) == len(t.nodes), "fixed save has a different number of nodes")
     for (name, *_), (name2, *_) in zip(src_save.nodes, t.nodes):
         need(name == name2, f"node {name} moved")
@@ -263,7 +305,7 @@ def fix_folder(src_dir):
     s = Save(src)
     new_node = fixed_node(s.node(NODE))
     if new_node is None:
-        print(f"{src_dir.name}: already has the 2.5 first-person body entries. Nothing to do.")
+        print(f"{src_dir.name}: already has the 2.5 first-person body entries (fpp_body_color). Nothing to do.")
         return None
     out, s, delta = rebuild(src, new_node)
     check(s, out, new_node, delta)
